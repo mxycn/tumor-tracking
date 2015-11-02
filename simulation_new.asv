@@ -1,0 +1,473 @@
+function [num_plot,ndir,nactual,n_seg,rms,std_dev,devp,pct95_3d,pct95_2d,pct98_3d,pct98_2d,pct98_ed,count95_3,timex] = ...
+    simulation_new(is_pre,is_block,factor1,factor2,factor3,seg_err,lag_time,thres_linearity,...
+    amp,duration_,init_gAng,end_gAng,runlength,incrt,sid,stdx,path_in)
+% Compared to simulation, this function adopts PCA method.
+% This function performs data input, reconstruction, and prediction, 
+% error calculation and plotting
+
+% is_pre = 1 if prediction is applied, 0 otherwise.
+
+% factor1 specifies the range of coordinate within which the points are
+% selected for multivariate regression. factor1=selected range/full extent
+% in that direction in the first 4 seconds.
+% factor2 specifies the range of velocity within which the points are
+% selected for multivariate regression. factor2=selected range/full extent
+% in that direction in the first 4 seconds.
+% factor3 specifies the ratio of the threshold controlling the predicted 
+% changes of positions to the extent in their respective direction.
+
+% seg_err specifies the rms error of detection(=0.5mm).
+
+% n_lag is the number of latent points, n=3 corresponds to 460ms, n=2
+% cooresponds to 310ms.
+
+% linearity presents the threshold of correlation coefficient for the motion of 
+% the first 4 seconds. If the threshould is surpassed, the data of the 4
+% second is discarded. The program moves to the data of next 4 seconds.
+
+% amp specifies the maximum ratio of motion amplitude of later data points
+% to that of the first 4 seconds.
+
+% duration_(=72): the time interval for one cycle of arc therapy
+% init_gAng(=-179): initial angle
+% end_gAng(=179): final angle
+% runlength(= 26): the number of initial points whose actual 3D coordinates
+%                  were measured in the first 4 seconds;
+% incrt(= 4): one sample point are taken ever incrt data points, whose 
+%             period is approximately 0.038545s.
+% sid(=1500): the Source-Imager distance.
+% stdx(=1000): the source-isocenter distance.
+% path_in: the folder of the data
+n_lag=round(lag_time/(incrt*38.5));
+angular_speed=abs(end_gAng-init_gAng)/duration_; % the rate of gantry rotation
+% est_length=floor(3.0*runlength/5.0)-4;
+ % the number of points used
+nactual=0; % the number of points available
+ % the sum of the square of standard deviation 
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+ModelerDataDir = path_in; % the folder of data
+cd(ModelerDataDir); 
+dbfolders = dir('DB*');
+ndir = length(dbfolders); % the number of folders
+npts=zeros(ndir,1); % the number of points in each folder
+% define an array to accept the data
+o3d=zeros(ndir,300000,4); % the array storing the original point data
+npoints=zeros(ndir,1);
+aberror2=zeros(ndir,1); % the sum of the square of 3D error
+ab_dev2=zeros(ndir,1);  % the sum of the square of 2D error
+std_dev2=zeros(ndir,1);
+percent95_3d=zeros(ndir,1);
+percent95_2d=zeros(ndir,1);
+percent98_3d=zeros(ndir,1);
+percent98_2d=zeros(ndir,1);
+num_plot=0;
+timex=[0 0];
+% read data from the data file
+[o3d,npts]=read_data(ndir,incrt,path_in);
+count95_3=0;
+count95_4=0;
+pct98_ed=0;
+num_coord=0;
+
+% where npts is the number of points which equals the total original data points
+% divided by incrt
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+ang_incrt=angular_speed*incrt*0.038545; % the angle interval between data points.
+delta_angle=ang_incrt*runlength;        % the angle rotated in the first 4 seconds.
+points_period=floor(358.0/ang_incrt);   % the number of points in a trajectory.
+n_seg=0;                  % the number of trajectories
+
+% k is the number of fractions
+% for k=1:1  % ndir is the total number of fractions for that patient.
+for k=1:ndir
+    pr_2d=zeros(npts(k),2); % the projection of the assumed point after repositioning.
+    r3d=zeros(npts(k),4);   % the 3D position estimated.
+    incr_3d=zeros(npts(k),3); % the predicted difference used for compensate for the lag of time.
+    r3dp=zeros(npts(k),3); % the predicted 3D position without optimization.
+    r3dr=zeros(npts(k),3); % the predicted 3D position with optimization.
+    ko3d=zeros(npts(k),4);
+    ko=zeros(npts(k),3);
+    ym=zeros(npts(k),2);
+
+    is_kv=zeros(npts(k),1);
+    perror3dx=zeros(npts(k),1); % the prediction error in 3D
+    recon_error3d=zeros(npts(k),1); % the 3D error of estimation
+    perror2d=zeros(npts(k),1);  % the beam's eye view 2D error after prediction
+
+    nactual=nactual+npts(k); % the number of data points read.
+    n_segment=0;             % the number of trajectories
+    jj=1;                     % index of data points 
+    j0=1;                    % index of the start point of a trajectory
+   
+ % the following stores real-time correlation information in the estimated 
+ % 3D data, used to update the correlation informaiton.
+    kx=zeros(npts(k),3);
+    
+    centerx=zeros(npts(k),3);
+    centerpoint=[0 0 0];
+    range_o3d=[0 0 0];
+    range_r3d=[0 0 0];
+    is_plane=0;
+    linearity=ones(npts(k),1);
+    n_domin=1;
+    k1=0;
+    k2=0;
+    k3=0;  
+    ko1=0;
+    ko2=0;
+    ko3=0;  
+
+    for ii=1:npts(k)
+        ko3d(ii,1)=o3d(k,ii,1);
+        ko3d(ii,2)=o3d(k,ii,2);
+        ko3d(ii,3)=o3d(k,ii,3);
+        ko3d(ii,4)=o3d(k,ii,4);
+    end        
+     
+ % cycle the whole data in a subfolder(corresponding to a fraction)
+while jj<npts(k) 
+% while jj<2500
+        r3d0=zeros(runlength,4);  % the initial noise-added "original" 3D data
+        is_jump=0;   % index indicating an abnormal trajectory due to 
+                     % excessive velocity, which is to be discarded. 
+%         centerpoint=[0 0 0]; % the center position in the initial 4 seconds.
+        
+        % Initializing: add detection error to the points of the first 4
+        % seconds, calculate the extent, correlation and linearity of the 
+        % motion for the first 4 seconds, and detect whether there is an 
+        % unrealistic velocity(if yes, is_jump=1)
+        if j0>npts(k)-points_period
+            break
+        end
+        [r3d0,centerpoint,is_plane,linearity0,n_domin,k1,k2,k3,ko1,ko2,ko3,range_o3d0,range_r3d0]=...
+            initializing_new(seg_err,j0,runlength,stdx,ko3d,sid);
+        [linearity_all,range_o3d0]=...
+            find_overall_track(j0,points_period,stdx,ko3d,sid);
+        
+        centerx(j0+runlength-1,:)=[centerpoint(1) centerpoint(2) centerpoint(3)];
+        kx(j0+runlength-1,:)=[k1 k2 k3];
+        
+        max_init=max(ko3d(j0:j0+runlength-1,1));
+        min_init=min(ko3d(j0:j0+runlength-1,1));
+        
+        % Screen for unqualified trajectories of the first 4 seconds, and
+        % skip them.
+        % The conditions include: 1)poor linearity; 2)Extraordinarily large
+        % or small amplitude of motion; 3)excessive velocity; 4) when the 
+        % time of the remaining points is less than duration.
+        
+        while (range_o3d0(1)<0.1 || range_o3d0(1) >50 || ...
+            range_o3d0(2)<0.1 || range_o3d0(2) >21 || ...
+            range_o3d0(3)<0.2 || range_o3d0(3) >30 || ...
+            abs(ko3d(j0,1)-max_init)<0.01 || abs(ko3d(j0,1)-min_init)<0.01 || linearity_all > high_linearity || ...
+            linearity_all < low_linearity || is_jump >0.1) && j0<npts(k)-points_period-1
+        
+            j0=j0+1;
+            [r3d0,centerpoint,is_plane,linearity0,n_domin,k1,k2,k3,ko1,ko2,ko3,range_o3d0,range_r3d0]=...
+                initializing_new(seg_err,j0,runlength,stdx,ko3d,sid);
+            [linearity_all,range_o3d0]=...
+                find_overall_track(j0,points_period,stdx,ko3d,sid);
+            kx(j0+runlength-1,:)=[k1 k2 k3];
+            max_init=max(o3d(k,j0:j0+runlength-1,1));
+            min_init=min(o3d(k,j0:j0+runlength-1,1));
+            centerx(j0+runlength-1,:)=[centerpoint(1) centerpoint(2) centerpoint(3)];   
+        end 
+        
+        % if the time of the remaining points is less than duration, stop
+        % the cycle.        
+        
+        % for the first 4 seconds, the noise-added data is directly
+        % assigned to the reconstructed data, because they are measured
+        % directly.
+        r3d(j0:j0+runlength-1,1)=r3d0(1:runlength,1); 
+        r3d(j0:j0+runlength-1,2)=r3d0(1:runlength,2);
+        r3d(j0:j0+runlength-1,3)=r3d0(1:runlength,3);
+        
+        jj=runlength+j0;   % index of the first point to be reconstructed.
+        is_discon=0;      % flag for interrupting the tracking.
+        is_success=0;     % flag for complete tracking of a whole trajectory.
+        is_drift=0;
+        
+        % initializing the projection points after the first 4 seconds.
+        
+        while is_discon<1                        
+            % projecting and reconstructing the jth point.
+            tic();
+            [r3dx,is_discon,centerpoint,kx(jj-1,:),ko(jj-1,:),ym(jj-1,:),range_o3d,is_jump,linearity(jj-1)]= ...
+                proj_backproj_new(seg_err,ko3d,r3d,jj,j0,init_gAng,end_gAng,delta_angle,ang_incrt,runlength,sid,stdx);
+
+            centerx(jj-1,:)=[centerpoint(1) centerpoint(2) centerpoint(3)];
+            xx1=toc();
+            timex(1)=timex(1)+xx1;
+            if xx1>0.020
+                fprintf('extra long estimation time:%f \n', xx1);
+            end
+         
+            % screen for possible unqualified trajectory using the 
+            % information in the actual data. The conditions include:
+            % 1)extraordinarily large ampllitude of motion; 2)Unusually large
+            % velocity; 3) a discontinuity in the original data(flagged
+            % by is_discon).
+            mid_screen_condition=range_o3d(1)>amp*range_o3d0(1) | ...
+                range_o3d(1) > 50 | range_o3d(2)>amp*range_o3d0(2) | ...
+                range_o3d(2) > 21 | range_o3d(3)>amp*range_o3d0(3) | ...
+                range_o3d(3) > 30 | is_jump>0.1 | is_discon > 1;
+                % if an unqualified trajectory is encountered, jump out the
+                % current cycle and move onto the next point and start
+                % another trajectory.           
+            if mid_screen_condition 
+                jj=jj+1; 
+                break  
+%             else
+%                 denomatorx=sqrt(ko(jj-1,1)*ko(jj-1,1)+ko(jj-1,2)*ko(jj-1,2)+ko(jj-1,3)*ko(jj-1,3))*...
+%                     sqrt(kx(jj-1,1)*kx(jj-1,1)+kx(jj-1,2)*kx(jj-1,2)+kx(jj-1,3)*kx(jj-1,3));
+%                 cosangle=(ko(jj-1,1)*kx(jj-1,1)+ko(jj-1,2)*kx(jj-1,2)+ko(jj-1,3)*kx(jj-1,3))/denomatorx;
+%                 if abs(cosangle)<0.996
+%                     jj=jj+1; 
+%                     break  
+%                 end
+            end
+
+            % accepting the returned values.
+            r3d(jj,1)=r3dx(1);
+            r3d(jj,2)=r3dx(2);
+            r3d(jj,3)=r3dx(3);            
+            
+            range_r3d=range(r3d(j0:jj,1:3),1);
+            
+            jj=jj+1;
+            % if one segment is complete, move to next segment(trajectory)
+            if init_gAng+ang_incrt*(jj-j0)>end_gAng 
+                is_discon=2;  % flag for terminating the cycle.
+                is_success=1; % indicating a completed tracking
+            end
+        end % discon>1-...        
+
+    % if the cycle of reconstruction is completed, make prediction and 
+    % calculate the error & plot the graph
+         if is_success>0.5 && jj<npts(k) 
+             % the number of cycle steps up
+             n_segment=n_segment+1;              
+             % the calculation is done starting from the j0+n_lag, the
+             % first n_lag points are neglected.
+             for ik=1:n_lag
+                 r3dr(j0+ik-1,1)=NaN;
+                 r3dr(j0+ik-1,2)=NaN;
+                 r3dr(j0+ik-1,3)=NaN;
+                 r3dp(j0+ik-1,1)=NaN;
+                 r3dp(j0+ik-1,2)=NaN;
+                 r3dp(j0+ik-1,3)=NaN;
+             end
+             % calculate the 3D extent of the trajectory in the first
+             % 4 seconds, for later reference.
+             
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%             
+             % start predicting
+             is_used=[0 0 0];
+             maxi=[0 0 0];
+             %initializing the avarage
+             av3d=zeros(points_period,3);             
+             for jx=j0+n_lag:jj-1  
+                 g_Ang=init_gAng+ang_incrt*(jx-j0);               
+                 av3d(jx-j0+1-n_lag,1)=r3d(jx-n_lag,1);
+                 av3d(jx-j0+1-n_lag,2)=r3d(jx-n_lag,2);
+                 av3d(jx-j0+1-n_lag,3)=r3d(jx-n_lag,3); 
+                 if jx>j0+n_lag+1
+                     av3d(jx-j0-n_lag,1)=(r3d(jx-n_lag-2,1)+2*r3d(jx-n_lag-1,1)+r3d(jx-n_lag,1))/4;
+                     av3d(jx-j0-n_lag,2)=(r3d(jx-n_lag-2,2)+2*r3d(jx-n_lag-1,2)+r3d(jx-n_lag,2))/4;
+                     av3d(jx-j0-n_lag,3)=(r3d(jx-n_lag-2,3)+2*r3d(jx-n_lag-1,3)+r3d(jx-n_lag,3))/4; 
+%                      av3d(jx-j0-n_lag,1)=(r3d(jx-n_lag-2,1)+r3d(jx-n_lag-1,1)+r3d(jx-n_lag,1))/3;
+%                      av3d(jx-j0-n_lag,2)=(r3d(jx-n_lag-2,2)+r3d(jx-n_lag-1,2)+r3d(jx-n_lag,2))/3;
+%                      av3d(jx-j0-n_lag,3)=(r3d(jx-n_lag-2,3)+r3d(jx-n_lag-1,3)+r3d(jx-n_lag,3))/3; 
+                 end             
+                 if jx>j0+runlength && n_lag>0.1 
+                     tic();
+                     % calculate the immediate past range
+                     extentxx=near_range3d(jx,j0,runlength,n_lag,r3d);                     
+                     % calculate the difference between the point n_log
+                     % before and the current point, for prediction. Note the
+                     % input information is from the points at least n_lag
+                     % before.            
+                    [incr_3d(jx-n_lag,1) incr_3d(jx-n_lag,2) incr_3d(jx-n_lag,3)]=predicting(is_pre,factor1,factor2,n_lag,jx-n_lag,j0,extentxx,av3d);                     
+                     % Add the difference to the position n_lag points before 
+                     % to get the predicted position of the current point.
+                     % If the calculated difference is too large, replace
+                     % it with a threshold value, which is based on the
+                     % amplitude of motion in the first 4 seconds. 
+                     [r3dp(jx,1) r3dp(jx,2) r3dp(jx,3)]=prediction_screening(jx,n_lag,r3d,incr_3d,extentxx,factor3);
+                     % optimize the prediction result with the updated 
+                     % correlation information n_lag points before 
+                     if jx>j0+n_lag+runlength
+                         r3dr(jx,:)=prediction_optimizing_new(jx,r3dp,stdx,centerx(jx-n_lag,:),kx(jx-n_lag,:),linearity(jx-n_lag)); % true realtime  
+                     else
+                         r3dr(jx,:)=[r3dp(jx,1) r3dp(jx,2) r3dp(jx,3)];
+                     end
+                     
+                     % the following is the simulation of blockage and the
+                     % update of estimated coordinates and centerpoints.
+
+                     if is_block==1 % if blockage is simulated.
+                         if is_kv(jx+2-n_lag,1)==1 % that means kV image is available at jx+1-n_lag, 
+                             % judge whether point jx-1 is actually blocked.                                           
+                             if (jx+2-n_lag-j0>202 && jx+2-n_lag-j0<281) || (jx+2-n_lag-j0>351 && jx+2-n_lag-j0<430) 
+                                 temp_pt1=[0 0 0];
+                                 is_kv(jx+3-n_lag,1)=1; % more kV images to come
+                                 temp_pt1=kv_imaging_new(jx+1-n_lag,j0,centerx(jx-n_lag,:),kx(jx-n_lag,:),ym(jx-n_lag,1),ym(jx-n_lag,2),g_Ang-ang_incrt,seg_err,sid,stdx,ko3d);
+                                 r3d(jx+1-n_lag,1)=temp_pt1(1);
+                                 r3d(jx+1-n_lag,2)=temp_pt1(2);
+                                 r3d(jx+1-n_lag,3)=temp_pt1(3);
+                             else % if point jx+1-n_lag is not blocked, stereostatic imaging is used.
+                                 r3d(jx+1-n_lag,1)=ko3d(jx+1-n_lag,1) + seg_err * stdx/sid * randn();
+                                 r3d(jx+1-n_lag,2)=ko3d(jx+1-n_lag,2) + seg_err * stdx/sid * randn();
+                                 r3d(jx+1-n_lag,3)=ko3d(jx+1-n_lag,3) + seg_err * stdx/sid * randn();  
+                                 r3d(jx+1-n_lag,4)=ko3d(jx+1-n_lag,4); 
+                                 is_kv(jx+2-n_lag,1)=0;                                 
+                             end
+                         % the point jx+1-n_lag needs to be updated.
+                         % see if jx+1-n_lag is blocked, if yes, calculate
+                         % its value, instead of measuring it.
+                         elseif (jx+2-n_lag-j0>202 && jx+2-n_lag-j0<281) || (jx+2-n_lag-j0>351 && jx+2-n_lag-j0<430)
+                             r3d(jx+1-n_lag,1)=(r3dr(jx+1-n_lag,1)+2*r3d(jx-n_lag,1))/3.0;
+                             r3d(jx+1-n_lag,2)=(r3dr(jx+1-n_lag,2)+2*r3d(jx-n_lag,2))/3.0;
+                             r3d(jx+1-n_lag,3)=(r3dr(jx+1-n_lag,3)+2*r3d(jx-n_lag,3))/3.0;
+                             is_kv(jx+4-n_lag,1)=1; % set current flag to 1, 
+                                            % meaning turn the kv imager on
+                                            % at jx(found at jx+1-n_lag, on at
+                                            % jx+2-n_lag, availabe at jx+3-n_lag).
+                         end % of
+                         % calculate the error.
+                         [recon_error3d(jx) perror3dx(jx) perror2d(jx)]=error_calculation(k,jx-1,g_Ang-ang_incrt,sid,stdx,o3d,r3d,r3dr);                         
+                     else % of if is_block==1. No blockage simulation.  
+                         [recon_error3d(jx) perror3dx(jx) perror2d(jx)]=error_calculation(k,jx,g_Ang,sid,stdx,o3d,r3d,r3dr);
+                     end % of if is_block==1. blockage simulation is finished. 
+                     xx2=toc();
+                     timex(2)=timex(2)+xx2;
+                     if xx2>0.020
+                         fprintf('extra long prediction time:%f \n', xx2);
+                     end
+                 else % of jx>j0+runlength ...
+                      % if the point position is measured in the first 4
+                      % seconds, or no latency is considered.
+                      % no prediction is made, use the latest point estimated  
+                     if is_block==1 && ((jx-j0>202 && jx-j0<281) || (jx-j0>351 && jx-j0<430))
+                         temp_pt1=[0 0 0];
+                         temp_pt1=kv_imaging_new(jx,j0,centerx(jx-1,:),kx(jx-1,:),ym(jx-1,1),ym(jx-1,2),g_Ang-ang_incrt,seg_err,sid,stdx,ko3d);
+                         r3d(jx,1)=temp_pt1(1);
+                         r3d(jx,2)=temp_pt1(2);
+                         r3d(jx,3)=temp_pt1(3);
+                     end                    
+                     r3dr(jx,1:3)=r3d(jx-n_lag,1:3);
+                     % calculate the projection of estimated position.
+                     [recon_error3d(jx) perror3dx(jx) perror2d(jx)]=error_calculation(k,jx,g_Ang,sid,stdx,o3d,r3d,r3dr);
+                 end % of jx>j0+runlength ...
+                 
+                 % the number of points predicted increases by one.
+                 npoints(k)=npoints(k)+1;               
+                 % 
+                 aberror2(k)=aberror2(k)+perror3dx(jx)*perror3dx(jx);
+                 ab_dev2(k)=ab_dev2(k)+perror2d(jx)*perror2d(jx);
+             end % of "for jx=j0+n_lag:jj-1"
+             denomatorx=sqrt(ko(jj-2,1)*ko(jj-2,1)+ko(jj-2,2)*ko(jj-2,2)+ko(jj-2,3)*ko(jj-2,3))*...
+                 sqrt(ko1*ko1+ko2*ko2+ko3*ko3);
+             cosangle=(ko(jj-2,1)*ko1+ko(jj-2,2)*ko2+ko(jj-2,3)*ko3)/denomatorx;
+             if abs(cosangle)<0.966
+                 num_coord=num_coord+1;                  
+             end
+             % calculate the variation of the trajectory itself.
+             od=zeros(jj-j0,3);
+             % construct a new array for calculating the standard deviation
+             % of the trajectory.
+             od(:,1)=o3d(k,j0:jj-1,1);
+             od(:,2)=o3d(k,j0:jj-1,2);
+             od(:,3)=o3d(k,j0:jj-1,3);
+             % sum up the square of all standard deviation.
+             std_deviation=sqrt(std(od(1:jj-j0,1))*std(od(1:jj-j0,1))+...
+                 std(od(1:jj-j0,2))*std(od(1:jj-j0,2))+...
+                 std(od(1:jj-j0,3))*std(od(1:jj-j0,3)));
+             std_dev2(k)=std_deviation*std_deviation*(jj-j0-1)+std_dev2(k); 
+             %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+             % draw the figure of the error and predicated vs. actual
+             % position.             
+             xcoord=zeros(points_period,1);
+             for i=1:points_period
+                 xcoord(i)=ang_incrt*(i-1)+init_gAng+180;
+             end
+             
+             std1=norm(perror2d(j0+n_lag:j0+points_period-1))/sqrt(points_period-n_lag); % average 2D error with prediction
+             max1=max(perror2d(j0+runlength+2:j0+points_period-1));
+             std2=norm(perror3dx(j0+n_lag:j0+points_period-1))/sqrt(points_period-n_lag); 
+             std3=norm(recon_error3d(j0+runlength:j0+points_period-1))/sqrt(points_period-runlength); % average 3D error of pure estimation
+             percent95_3dx=get_percentile_error(perror3dx,0.95,j0+n_lag,j0+points_period-1);
+             percent95_2dx=get_percentile_error(perror2d,0.95,j0+n_lag,j0+points_period-1);
+             percent98_3dx=get_percentile_error(perror3dx,0.98,j0+n_lag,j0+points_period-1);
+             percent98_2dx=get_percentile_error(perror2d,0.98,j0+n_lag,j0+points_period-1);
+             percent95_3d(k)=percent95_3d(k)+percent95_3dx;
+             percent95_2d(k)=percent95_2d(k)+percent95_2dx;
+             percent98_3d(k)=percent98_3d(k)+percent98_3dx;
+             percent98_2d(k)=percent98_2d(k)+percent98_2dx;
+             if percent95_2dx>3.0
+                 count95_3=count95_3+1;
+                 if percent95_2dx>4.0
+                     count95_4=count95_4+1;
+                 end                 
+             end
+% %              plotting_condition=((std1 > 1.35 & std2 < 2.45) | (std1 > 12.69 & std2>13.29) | max1 > 19.3) &...
+% %                  ((kk1(jj-3,4)-kk1(jj-3,3))>3.0*(kkk1(4)-kkk1(3)) | ...
+% %                  (kk1(jj-3,8)-kk1(jj-3,7))>3.0*(kkk1(8)-kkk1(7)) | ...
+% %                  (kk2(jj-3,8)-kk2(jj-3,7))>3.0*(kkk2(8)-kkk2(7))) & ...
+% %                  (abs(kko1(jj-1,9))>0.92 | abs(kko2(jj-1,9))< 0.92 | ...
+% %                  (abs(kko1(jj-1,9))>0.9 & abs(kko2(jj-1,9))> 0.9));
+% 
+%              conditionx=std1<1.70 & std_deviation> 3.0 & k==1 & (j0==1871 | j0==11774);  
+             conditionx=std1<1.45 & std_deviation> 4.0 & linearity(jj-2)> 0.96;  
+%              conditionx= k==1 & j0<500;
+             modex=2;
+             num_plot=1;
+             if num_plot<0.5
+                 num_plot=plotfigures(conditionx,modex,is_block,n_segment,k,j0,points_period,xcoord,o3d,r3dr,r3d,perror2d,perror3dx,recon_error3d,is_kv,std1,dbfolders);
+                 n_segment=n_segment+200;
+                 modex=1;
+                 num_plot=plotfigures(conditionx,modex,is_block,n_segment,k,j0,points_period,xcoord,o3d,r3dr,r3d,perror2d,perror3dx,recon_error3d,is_kv,std1,dbfolders);
+                 n_segment=n_segment-200;
+             end 
+         end % of "is_success>0.5 & jj<npts(k)."
+         is_success=0;  % reset the flag of completing a trajectory      
+         j0=jj; % one cycle is finished, shift the starting point      
+    end % of while jj<npts(k)
+    n_seg=n_seg + n_segment; % the number of trajectories increases by n_segment.
+    if n_segment>1 || npoints(k)>1
+        percent95_3d(k)=percent95_3d(k)/n_segment;
+        percent95_2d(k)=percent95_2d(k)/n_segment;
+        percent98_3d(k)=percent98_3d(k)/n_segment;
+        percent98_2d(k)=percent98_2d(k)/n_segment;
+        std_dev2(k)=std_dev2(k)/npoints(k);
+        aberror2(k)=aberror2(k)/npoints(k);
+        ab_dev2(k)=ab_dev2(k)/npoints(k);     
+    else
+        percent95_3d(k)=0;
+        percent95_2d(k)=0;
+        percent98_3d(k)=0;
+        percent98_2d(k)=0;
+        std_dev2(k)=0;
+        aberror2(k)=0;
+        ab_dev2(k)=0;
+    end
+end % of k...
+
+std_dev=sum(sqrt(std_dev2(1:ndir)))/ndir; % total standard deviation of the patient.
+rms=sum(sqrt(aberror2(1:ndir)))/ndir;     % total rms 3D error
+devp=sum(sqrt(ab_dev2(1:ndir)))/ndir;     % total 2D error
+pct95_3d=mean(percent95_3d(1:ndir));
+pct95_2d=mean(percent95_2d(1:ndir));
+pct98_3d=mean(percent98_3d(1:ndir));
+pct98_2d=mean(percent98_2d(1:ndir));
+
+% indicate the analysis of one patient is finished
+fprintf('the number of trajectories = %u \n', n_seg); 
+fprintf('the number of fractions = %u \n', ndir); 
+num_plot=1;
+
+return

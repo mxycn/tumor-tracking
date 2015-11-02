@@ -1,0 +1,6 @@
+function [bb rr]=six_var_regress(n,x1,x2,x3,y1,y2,y3,z1,z2,z3)
+% each z = b1 + b2*x1 + b2*x2 + b3*x3 + b4*y1 +  b5*y2 + b6*y3
+
+[bb,bint,r,rint,stats] = regress(z,[ones(n,1) x y] );
+rr = stats(1);
+return
